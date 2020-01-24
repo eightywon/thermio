@@ -1,58 +1,37 @@
-#include <WiFi.h>
-#include <WiFiClient.h>
 #include <WiFiMulti.h>
 #include <HTTPClient.h>
-#include "ADS1115.h"
-#include <Adafruit_GFX.h>
+#include <ADS1115.h>
 #include <Adafruit_SSD1306.h>
 #include <Arduino_JSON.h>
-#include <WiFiUdp.h>
 
-#define SLEEP_FOR 8000
-#define THERMISTORNOMINAL 200000
-#define TEMPERATURENOMINAL 25
-#define NUMSAMPLES 5
-#define BCOEFFICIENT 3500
-#define SERIESRESISTOR 10000
-#define NUMPROBES 4
-
-//oled
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 32 // OLED display height, in pixels
-#define OLED_RESET     27 // Reset pin # (or -1 if sharing Arduino reset pin)
-
+//ADC temp readings
 ADS1115 adc(ADS1115_DEFAULT_ADDRESS);
-WiFiMulti wifiMulti;
+#define SLEEP_FOR 8000
+#define THERMISTORNOMINAL 200000 //thermistor nominal resistance
+#define TEMPERATURENOMINAL 25    //temp in C for nominal resistance
+#define NUMSAMPLES 8             //number of samples to average over to reduce interference skew
+#define BCOEFFICIENT 3500
+#define SERIESRESISTOR 10000     //fixed resistor value used in Wheatstone bridge
+#define NUMPROBES 4
+float inF[NUMPROBES];
+const int adcMax=(3.3/6.144)*32767;
+
+//128x32 oled
+#define SCREEN_WIDTH 128   // OLED display width, in pixels
+#define SCREEN_HEIGHT 32   // OLED display height, in pixels
+#define OLED_RESET     27  // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-//get time from NTP server
-WiFiUDP UDP;
-IPAddress timeServerIP;
-const char* NTPServerName = "time.nist.gov"; //as good as any
-const int NTP_PACKET_SIZE = 48;
-byte NTPBuffer[NTP_PACKET_SIZE];
+//wifi connection
+WiFiMulti wifiMulti;
 
-float inF[NUMPROBES];
-const int adcMax = (3.3 / 6.144) * 32767;
+//REST post of readings to cloud
+HTTPClient http;
 
 //functions
 void getTemps(uint8_t probe);
-void outputTemps(char ts[9]);
+void outputTemps();
 void init_ads1115();
-uint32_t getTime();
-void sendNTPpacket(IPAddress& address);
-int getSeconds(uint32_t UNIXTime);
-int getMinues(uint32_t UNIXTime);
-int getHours(uint32_t UNIXTime);
-void startUDP();
-
-//ntp
-unsigned long intervalNTP = 60000; // Request NTP time every minute
-unsigned long prevNTP = 0;
-unsigned long lastNTPResponse = millis();
-uint32_t timeUNIX = 0;
-
-unsigned long prevActualTime = 0;
 
 void setup() {
   Serial.begin(115200); // initialize serial communication
@@ -67,43 +46,50 @@ void setup() {
   display.clearDisplay();
   display.setTextSize(2); // Draw 2X-scale text
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.print("trying WAP");
-  delay(500);
+  display.setCursor(0,0);
+  display.print("going WAP");
+  delay(1000);
   display.display();
   
   Serial.println("setting ap");
-  wifiMulti.addAP("", "");
-  wifiMulti.addAP("", "!");
-  Serial.println("Connecting ...");
-  uint16_t x=0,y=0;
-  while (wifiMulti.run() != WL_CONNECTED) {
-    delay(250);
-    Serial.print('.');
+  wifiMulti.addAP("","");
+  wifiMulti.addAP("","");
+  Serial.println("Connecting...");
+
+  uint8_t idx=0;
+  String msg="trying...";
+  auto startTime=millis();
+  uint8_t constatus;
+  while (constatus!=WL_CONNECTED) {
+   if (millis()%5000==0) {
+    constatus=wifiMulti.run(500);
+   }
+   if (millis()%250==0) {
+    (idx>2) ? idx=0 : idx++;
     display.clearDisplay();
     display.setTextSize(2); // Draw 2X-scale text
     display.setTextColor(SSD1306_WHITE);
-    if (x>=128) {
-      x=0;
-      y++;
-    }
-    display.setCursor(y,x);
-    display.print(".");
+    display.setCursor(0,6);
+    display.print(msg.substring(0,((msg.length()-3)+idx)));
     display.display();
-    x++;
+   }
   }
-  startUDP();
-  if (!WiFi.hostByName(NTPServerName, timeServerIP)) { // Get the IP address of the NTP server
-    Serial.println("DNS lookup failed. Rebooting.");
-    Serial.flush();
-    ESP.restart();
+  
+  /*
+  while (wifiMulti.run(1000) != WL_CONNECTED) {
+   
+   if (millis()%250==0) {
+    Serial.print('.');
+    (idx>2) ? idx=0 : idx++;
+    display.clearDisplay();
+    display.setTextSize(2); // Draw 2X-scale text
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,6);
+    display.print(msg.substring(0,((msg.length()-3)+idx)));
+    display.display();
+   }
   }
-  Serial.print("Time server IP:\t");
-  Serial.println(timeServerIP);
-
-  Serial.println("\r\nSending NTP request ...");
-  sendNTPpacket(timeServerIP);
-
+  */
 
   display.clearDisplay();
   display.setTextSize(2); // Draw 2X-scale text
@@ -130,35 +116,11 @@ void setup() {
 }
 
 void loop() {
-  unsigned long currentMillis = millis();
-  char ts[9];
-
-  if (currentMillis - prevNTP > intervalNTP) { // If a minute has passed since last NTP request
-    prevNTP = currentMillis;
-    Serial.println("\r\nSending NTP request ...");
-    sendNTPpacket(timeServerIP);               // Send an NTP request
-  }
-
-  if (millis() % SLEEP_FOR == 0) {
-    uint32_t time = getTime();                   // Check if an NTP response has arrived and get the (UNIX) time
-    if (time) {                                  // If a new timestamp has been received
-      timeUNIX = time;
-      Serial.print("NTP response:\t");
-      Serial.println(timeUNIX);
-      lastNTPResponse = currentMillis;
-    } else if ((currentMillis - lastNTPResponse) > 3600000) {
-      //ESP.reset();
-    }
-    uint32_t actualTime = timeUNIX + (currentMillis - lastNTPResponse) / 1000;
-    if (actualTime != prevActualTime && timeUNIX != 0) { // If a second has passed since last print
-      prevActualTime = actualTime;
-      snprintf(ts, 9, "%02d:%02d:%02d", getHours(actualTime), getMinutes(actualTime), getSeconds(actualTime));
-    }
+  if (millis()%SLEEP_FOR==0) {
     for (uint8_t probe = 0; probe < NUMPROBES; probe++) {
       getTemps(probe);
     }
-    Serial.println(ts);
-    outputTemps(ts);
+    outputTemps();
   }
 }
 
@@ -181,58 +143,53 @@ void getTemps(uint8_t probe) {
       break;
   }
 
-  //get average over 8 readings to adjust for noise
+  //get average over NUMSAMPLES readings to adjust for noise
   avg = 0;
-  for (uint8_t i = 0; i < 8; i++) {
-    avg += adc.getConversion(true);
+  for (uint8_t i=0;i<NUMSAMPLES;i++) {
+    avg+=adc.getConversion(true);
   }
-  avg = avg / 8;
-  avg = adcMax / avg - 1;
-  avg = SERIESRESISTOR / avg;
-  Serial.print("Thermistor resistance p"); Serial.print(String(probe) + ": "); Serial.println(avg);
+  avg=avg/NUMSAMPLES;
+  avg=adcMax/avg-1;
+  avg=SERIESRESISTOR/avg;
+  Serial.print("Thermistor resistance p"); Serial.print(String(probe)+": "); Serial.println(avg);
 
   //calculate temp in C using steinhart/hart equation
-  avg = avg / THERMISTORNOMINAL;               // (R/Ro)
-  avg = log(avg);                              // ln(R/Ro)
-  avg /= BCOEFFICIENT;                         // 1/B * ln(R/Ro)
-  avg += 1.0 / (TEMPERATURENOMINAL + 273.15);  // + (1/To)
-  avg = 1.0 / avg;                             // Invert
-  avg -= 273.15;                               // convert to C
+  avg=avg/THERMISTORNOMINAL;                 // (R/Ro)
+  avg=log(avg);                              // ln(R/Ro)
+  avg/=BCOEFFICIENT;                         // 1/B * ln(R/Ro)
+  avg+=1.0/(TEMPERATURENOMINAL+273.15);      // + (1/To)
+  avg=1.0/avg;                               // Invert
+  avg-=273.15;                               // convert to C
 
-  Serial.print("p"); Serial.print(String(probe) + ": "); Serial.print(avg); Serial.println("C");
-  inF[probe] = avg * 9 / 5 + 32; //convert to F
-  Serial.print(F("p")); Serial.print(String(probe) + ": "); Serial.print(inF[probe]); Serial.println(F("F"));
+  Serial.print("p"); Serial.print(String(probe)+": "); Serial.print(avg); Serial.println("C");
+  inF[probe]=avg*9/5+32; //convert to F
+  Serial.print(F("p")); Serial.print(String(probe)+": "); Serial.print(inF[probe]); Serial.println(F("F"));
 }
 
-void outputTemps(char ts[9]) {
+void outputTemps() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  for (uint8_t i = 0; i < NUMPROBES; i++) {
-    display.setCursor(10, i * 8);
+  for (uint8_t i=0; i<NUMPROBES; i++) {
+    display.setCursor(10,i*8);
     display.print(F("Probe ")); display.print(i); display.print(F(": ")); display.print(inF[i]); display.cp437(true); display.write(7); display.cp437(true);
     display.display();
   }
 
   //post readings to remote host for web viewing
-  if (WiFi.status() == WL_CONNECTED) { //Check WiFi connection status
-    HTTPClient http;
-    //Post.begin("http://bbqpi/arduino.php");
+  if (WiFi.status()==WL_CONNECTED) { //Check WiFi connection status
     if (http.begin("https://thermi.pro:39780/api/setReading")) {
       JSONVar reading;
-      reading["cookid"] = "2";
-      reading["probe0"] = inF[0];
-      reading["probe1"] = inF[1];
-      reading["probe2"] = inF[2];
-      reading["probe3"] = inF[3];
-      reading["time"] = ts;
+      reading["cookid"]="2";
+      reading["probe0"]=inF[0];
+      reading["probe1"]=inF[1];
+      reading["probe2"]=inF[2];
+      reading["probe3"]=inF[3];
 
-      //http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-      http.addHeader("Content-Type", "application/json");
-      //int httpResponseCode = http.POST("probe0="+String(inF[0])+"&probe1="+String(inF[1])+"&probe2="+String(inF[2])+"&probe3="+String(inF[3]));
-      int httpResponseCode = http.POST(JSON.stringify(reading));
-      if (httpResponseCode > 0) {
-        String response = http.getString();                       //Get the response to the request
+      http.addHeader("Content-Type","application/json");
+      int httpResponseCode=http.POST(JSON.stringify(reading));
+      if (httpResponseCode>0) {
+        String response=http.getString();                       //Get the response to the request
         Serial.print(httpResponseCode); //Print return code
         Serial.print(": ");   //Print return code
         Serial.println(response);           //Print request answer
@@ -260,49 +217,4 @@ void init_ads1115() {
   adc.setComparatorLatchEnabled(ADS1115_COMP_LAT_NON_LATCHING);   // default/ignored because ALERT/RDY
   adc.setComparatorQueueMode(ADS1115_COMP_QUE_DISABLE);           // default/ignored because ALERT/RDY
   adc.setConversionReadyPinMode();
-}
-
-void startUDP() {
-  Serial.println("Starting UDP");
-  UDP.begin(123);                          // Start listening for UDP messages on port 123
-  //Serial.print("Local port:\t");
-  //Serial.println(UDP.localPort());
-  Serial.println();
-}
-
-uint32_t getTime() {
-  if (UDP.parsePacket() == 0) { // If there's no response (yet)
-    return 0;
-  }
-  UDP.read(NTPBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
-  // Combine the 4 timestamp bytes into one 32-bit number
-  uint32_t NTPTime = (NTPBuffer[40] << 24) | (NTPBuffer[41] << 16) | (NTPBuffer[42] << 8) | NTPBuffer[43];
-  // Convert NTP time to a UNIX timestamp:
-  // Unix time starts on Jan 1 1970. That's 2208988800 seconds in NTP time:
-  const uint32_t seventyYears = 2208988800UL;
-  // subtract seventy years:
-  uint32_t UNIXTime = NTPTime - seventyYears;
-  return UNIXTime;
-}
-
-void sendNTPpacket(IPAddress& address) {
-  memset(NTPBuffer, 0, NTP_PACKET_SIZE);  // set all bytes in the buffer to 0
-  // Initialize values needed to form NTP request
-  NTPBuffer[0] = 0b11100011;   // LI, Version, Mode
-  // send a packet requesting a timestamp:
-  UDP.beginPacket(address, 123); // NTP requests are to port 123
-  UDP.write(NTPBuffer, NTP_PACKET_SIZE);
-  UDP.endPacket();
-}
-
-inline int getSeconds(uint32_t UNIXTime) {
-  return UNIXTime % 60;
-}
-
-inline int getMinutes(uint32_t UNIXTime) {
-  return UNIXTime / 60 % 60;
-}
-
-inline int getHours(uint32_t UNIXTime) {
-  return UNIXTime / 3600 % 24;
 }
